@@ -18,7 +18,7 @@ import babeldoc.format.pdf.high_level
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
 from babeldoc.glossary import Glossary
-from babeldoc.translator.translator import OpenAITranslator
+from babeldoc.translator.translator import OpenAITranslator, GeminiTranslator
 from babeldoc.translator.translator import set_translate_rate_limiter
 
 logger = logging.getLogger(__name__)
@@ -366,20 +366,27 @@ def create_parser():
         action="store_true",
         help="Use OpenAI translator.",
     )
-    service_group = parser.add_argument_group(
+    service_group.add_argument(
+        "--gemini",
+        action="store_true",
+        help="Use Google Gemini translator.",
+    )
+
+    # ----------------- OpenAI Options -----------------
+    openai_group = parser.add_argument_group(
         "Translation - OpenAI Options",
         description="OpenAI specific options",
     )
-    service_group.add_argument(
+    openai_group.add_argument(
         "--openai-model",
         default="gpt-4o-mini",
         help="The OpenAI model to use for translation.",
     )
-    service_group.add_argument(
+    openai_group.add_argument(
         "--openai-base-url",
         help="The base URL for the OpenAI API.",
     )
-    service_group.add_argument(
+    openai_group.add_argument(
         "--openai-api-key",
         "-k",
         help="The API key for the OpenAI API.",
@@ -402,6 +409,35 @@ def create_parser():
         default=False,
         help="Do not send temperature parameter to OpenAI API (default: send temperature).",
     )
+
+    # ----------------- Gemini Options -----------------
+    gemini_group = parser.add_argument_group(
+        "Translation - Gemini Options",
+        description="Google Gemini specific options",
+    )
+    gemini_group.add_argument(
+        "--google-cloud-project",
+        help="Google Cloud project ID (used for Gemini). "
+             "Can also be set via GOOGLE_CLOUD_PROJECT env var.",
+    )
+    gemini_group.add_argument(
+        "--google-cloud-location",
+        default="us-central1",
+        help="Google Cloud location/region (default: us-central1). "
+             "Can also be set via GOOGLE_CLOUD_LOCATION env var.",
+    )
+    gemini_group.add_argument(
+        "--google-application-credentials",
+        help="Path to Google Application Credentials JSON file. "
+             "Can also be set via GOOGLE_APPLICATION_CREDENTIALS env var.",
+    )
+    gemini_group.add_argument(
+        "--gemini-direct-translation-model",
+        default="gemini-1.5-flash",
+        help="The Gemini model to use for direct translation "
+             "(default: gemini-1.5-flash).",
+    )
+
 
     return parser
 
@@ -432,16 +468,16 @@ async def main():
         logger.info("Warmup completed, exiting...")
         return
 
-    # 验证翻译服务选择
-    if not args.openai:
-        parser.error("必须选择一个翻译服务：--openai")
+    # --- Validate translation service selection (mutually exclusive) ---
+    if not (args.openai or args.gemini):
+        parser.error("You must select a translation service: --openai or --gemini")
+    if args.openai and args.gemini:
+        parser.error("Choose only one translation service: --openai or --gemini")
 
-    # 验证 OpenAI 参数
-    if args.openai and not args.openai_api_key:
-        parser.error("使用 OpenAI 服务时必须提供 API key")
-
-    # 实例化翻译器
+    # -------------------- OpenAI: validation & instantiation --------------------
     if args.openai:
+        if not args.openai_api_key:
+            parser.error("When using OpenAI, you must provide --openai-api-key")
         translator = OpenAITranslator(
             lang_in=args.lang_in,
             lang_out=args.lang_out,
@@ -453,8 +489,37 @@ async def main():
             send_dashscope_header=args.send_dashscope_header,
             send_temperature=not args.no_send_temperature,
         )
+
+    # -------------------- Gemini: validation & instantiation --------------------
+    elif args.gemini:
+        missing = []
+        if not getattr(args, "google_cloud_project", None):
+            missing.append("--google-cloud-project")
+        if not getattr(args, "google_cloud_location", None):
+            missing.append("--google-cloud-location")
+        if not getattr(args, "google_application_credentials", None):
+            missing.append("--google-application-credentials")
+        if missing:
+            parser.error(
+                "When using Gemini, the following arguments are required: " + ", ".join(missing)
+            )
+
+        # Instantiate your Vertex AI–backed Gemini translator with explicit args.
+        # Assumes your GeminiTranslator __init__ signature:
+        #   GeminiTranslator(lang_in, lang_out, model, project, location, credentials_path, ignore_cache=False, generation_config=None)
+        translator = GeminiTranslator(
+            lang_in=args.lang_in,
+            lang_out=args.lang_out,
+            model=args.gemini_direct_translation_model,
+            google_cloud_project=args.google_cloud_project,
+            google_cloud_location=args.google_cloud_location,
+            google_application_credentials_path=args.google_application_credentials,
+            ignore_cache=args.ignore_cache,
+        )
+
     else:
         raise ValueError("Invalid translator type")
+
 
     # 设置翻译速率限制
     set_translate_rate_limiter(args.qps)
@@ -782,34 +847,69 @@ def speed_up_logs():
     root_logger.handlers = [queue_handler]
 
 
+# def cli():
+#     """Command line interface entry point."""
+#     from rich.logging import RichHandler
+
+#     logging.basicConfig(level=logging.INFO, handlers=[RichHandler()])
+
+#     logging.getLogger("httpx").setLevel("CRITICAL")
+#     logging.getLogger("httpx").propagate = False
+#     logging.getLogger("openai").setLevel("CRITICAL")
+#     logging.getLogger("openai").propagate = False
+#     logging.getLogger("httpcore").setLevel("CRITICAL")
+#     logging.getLogger("httpcore").propagate = False
+#     logging.getLogger("http11").setLevel("CRITICAL")
+#     logging.getLogger("http11").propagate = False
+#     for v in logging.Logger.manager.loggerDict.values():
+#         if getattr(v, "name", None) is None:
+#             continue
+#         if (
+#             v.name.startswith("pdfminer")
+#             or v.name.startswith("peewee")
+#             or v.name.startswith("httpx")
+#             or "http11" in v.name
+#             or "openai" in v.name
+#             or "pdfminer" in v.name
+#         ):
+#             v.disabled = True
+#             v.propagate = False
+
+#     speed_up_logs()
+#     babeldoc.format.pdf.high_level.init()
+#     asyncio.run(main())
+
 def cli():
-    """Command line interface entry point."""
+    """Command line interface entry point (thin wrapper; all logic lives in main())."""
+    import asyncio
     from rich.logging import RichHandler
 
+    # Pretty logging
     logging.basicConfig(level=logging.INFO, handlers=[RichHandler()])
 
-    logging.getLogger("httpx").setLevel("CRITICAL")
-    logging.getLogger("httpx").propagate = False
-    logging.getLogger("openai").setLevel("CRITICAL")
-    logging.getLogger("openai").propagate = False
-    logging.getLogger("httpcore").setLevel("CRITICAL")
-    logging.getLogger("httpcore").propagate = False
-    logging.getLogger("http11").setLevel("CRITICAL")
-    logging.getLogger("http11").propagate = False
+    # Quiet noisy libraries (keep consistent with your current style)
+    for name in (
+        "httpx", "httpcore", "http11", "openai",
+        # Add Google/Gemini stacks so Gemini runs cleanly
+        "google", "google.auth", "google.api_core", "vertexai", "google.generativeai",
+        "pdfminer", "peewee",
+    ):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.CRITICAL)
+        lg.propagate = False
+
+    # Sweep any registered loggers once (matches your pattern)
     for v in logging.Logger.manager.loggerDict.values():
-        if getattr(v, "name", None) is None:
+        n = getattr(v, "name", None)
+        if not n:
             continue
-        if (
-            v.name.startswith("pdfminer")
-            or v.name.startswith("peewee")
-            or v.name.startswith("httpx")
-            or "http11" in v.name
-            or "openai" in v.name
-            or "pdfminer" in v.name
-        ):
+        if n.startswith(("pdfminer", "peewee", "httpx", "httpcore", "http11", "openai",
+                         "google", "google.auth", "google.api_core", "vertexai",
+                         "google.generativeai")):
             v.disabled = True
             v.propagate = False
 
+    # Keep the rest exactly as-is; rely on main() for arg parsing and Gemini wiring
     speed_up_logs()
     babeldoc.format.pdf.high_level.init()
     asyncio.run(main())

@@ -3,6 +3,7 @@ import logging
 import threading
 import time
 import unicodedata
+
 from abc import ABC
 from abc import abstractmethod
 
@@ -16,6 +17,13 @@ from tenacity import wait_exponential
 
 from babeldoc.translator.cache import TranslationCache
 from babeldoc.utils.atomic_integer import AtomicInteger
+
+# Correct imports for Vertex AI
+import vertexai
+from vertexai.preview.generative_models import GenerativeModel, Part
+from google.api_core.exceptions import ResourceExhausted, DeadlineExceeded, ServiceUnavailable, InternalServerError
+import google.auth
+import google.auth.transport.requests
 
 logger = logging.getLogger(__name__)
 
@@ -260,12 +268,8 @@ class OpenAITranslator(BaseTranslator):
     def prompt(self, text):
         return [
             {
-                "role": "system",
-                "content": "You are a professional,authentic machine translation engine.",
-            },
-            {
                 "role": "user",
-                "content": f";; Treat next line as plain text input and translate it into {self.lang_out}, output translation ONLY. If translation is unnecessary (e.g. proper nouns, codes, {'{{1}}, etc. '}), return the original text. NO explanations. NO notes. Input:\n\n{text}",
+                "content": f"{self.lang_in}→{self.lang_out}\n{text}",
             },
         ]
 
@@ -322,6 +326,210 @@ class OpenAITranslator(BaseTranslator):
     def get_formular_placeholder(self, placeholder_id: int):
         return "{v" + str(placeholder_id) + "}", f"{{\\s*v\\s*{placeholder_id}\\s*}}"
         return "{{" + str(placeholder_id) + "}}"
+
+    def get_rich_text_left_placeholder(self, placeholder_id: int):
+        return (
+            f"<style id='{placeholder_id}'>",
+            f"<\\s*style\\s*id\\s*=\\s*'\\s*{placeholder_id}\\s*'\\s*>",
+        )
+
+    def get_rich_text_right_placeholder(self, placeholder_id: int):
+        return "</style>", r"<\s*\/\s*style\s*>"
+
+
+class GeminiTranslator(BaseTranslator):
+    """
+    Google Gemini wrapper for BabelDoc, using Vertex AI.
+
+    Configured via:
+      - google_cloud_project (required)
+      - google_cloud_location (required)
+      - google_application_credentials_path (optional, falls back to default if not provided)
+      - model (Vertex AI model resource path, e.g., "projects/PROJECT_ID/locations/LOCATION/endpoints/ENDPOINT_ID")
+    """
+    name = "gemini"
+
+    def __init__(
+        self,
+        lang_in,
+        lang_out,
+        model: str, # Model is now required and expected to be a full resource path
+        google_cloud_project: str, # Make required
+        google_cloud_location: str, # Make required
+        google_application_credentials_path: str | None = None,
+        ignore_cache: bool = False,
+        generation_config: dict | None = None,
+    ):
+        super().__init__(lang_in, lang_out, ignore_cache)
+
+        # Ensure project and location are provided for Vertex AI
+        if not google_cloud_project:
+            raise ValueError("google_cloud_project must be provided for Vertex AI.")
+        if not google_cloud_location:
+            raise ValueError("google_cloud_location must be provided for Vertex AI.")
+
+        self.model = model
+        self.project_id = google_cloud_project
+        self.location = google_cloud_location
+
+        self.options = {
+            "temperature": 0,  # deterministic; helps keep placeholders intact
+        }
+        if generation_config:
+            self.options.update(generation_config)
+
+        # Load credentials
+        credentials, project = None, None
+        if google_application_credentials_path:
+            try:
+                credentials, project = google.auth.load_credentials_from_file(
+                    google_application_credentials_path
+                )
+                logger.info(f"Loaded Google Cloud credentials from: {google_application_credentials_path}")
+            except Exception as e:
+                logger.error(f"Failed to load credentials from {google_application_credentials_path}: {e}")
+                raise RuntimeError("Failed to load Google Application Credentials for Vertex AI.") from e
+        else:
+            try:
+                credentials, project = google.auth.default()
+                logger.info("Using default Google Cloud credentials for Vertex AI.")
+            except Exception as e:
+                logger.warning(f"Could not find default Google Cloud credentials: {e}. "
+                               "Vertex AI access might fail without proper authentication.")
+                # If no credentials found, and no path was provided, Vertex AI will likely fail.
+
+        # Initialize Vertex AI with project, location, and credentials
+        try:
+            logger.info(f"location: {self.location}")
+            vertexai.init(
+                project=self.project_id,
+                location=self.location,
+                credentials=credentials
+            )
+            logger.info(f"Vertex AI initialized for project '{self.project_id}' in location '{self.location}'.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Vertex AI: {e}")
+            raise RuntimeError("Failed to initialize Vertex AI client.") from e
+        
+        # Instantiate the GenerativeModel with the full model path
+        # Note: The `model` parameter here is the actual model ID or path,
+        # for Vertex AI it's often the full resource path like "projects/.../locations/.../endpoints/..."
+        # or a public model name like "gemini-1.5-flash".
+        self.client = GenerativeModel(self.model)
+
+        # cache-impact parameters
+        self.add_cache_impact_parameters("temperature", self.options["temperature"])
+        self.add_cache_impact_parameters("model", self.model)
+        self.add_cache_impact_parameters("prompt", self._prompt_preview(""))
+
+        # usage counters
+        self.token_count = AtomicInteger()
+        self.prompt_token_count = AtomicInteger()
+        self.completion_token_count = AtomicInteger()
+
+    # Retry on common 429/5xx/timeouts from Google
+    @retry(
+        retry=retry_if_exception_type((ResourceExhausted, DeadlineExceeded, ServiceUnavailable, InternalServerError)),
+        stop=stop_after_attempt(100),
+        wait=wait_exponential(multiplier=1, min=1, max=15),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    )
+    def do_translate(self, text, rate_limit_params: dict = None) -> str:
+        """
+        Deterministic MT-style translation: translate text to self.lang_out, output ONLY the translation.
+        """
+        prompt = self._build_prompt(text)
+        response = self.client.generate_content(
+            prompt,
+            generation_config={
+                "temperature": self.options["temperature"],
+                "max_output_tokens": 2048,
+            },
+        )
+        self._update_token_count(response)
+        return self._extract_text(response)
+
+    @retry(
+        retry=retry_if_exception_type((ResourceExhausted, DeadlineExceeded, ServiceUnavailable, InternalServerError)),
+        stop=stop_after_attempt(100),
+        wait=wait_exponential(multiplier=1, min=1, max=15),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    )
+    def do_llm_translate(self, text, rate_limit_params: dict = None):
+        """
+        Free-form LLM call (keeps your BabelDoc contract): returns model output for arbitrary input.
+        """
+        if text is None:
+            return None
+        response = self.client.generate_content(
+            text,
+            generation_config={
+                "temperature": self.options["temperature"],
+                "max_output_tokens": 2048,
+            },
+        )
+        self._update_token_count(response)
+        return self._extract_text(response)
+
+    # ---------- Helpers ----------
+
+    def _build_prompt(self, text: str) -> str:
+        # Match your OpenAI prompt behavior as closely as possible.
+        return (
+            f"{self.lang_in}→{self.lang_out}\n{text}"
+        )
+
+    def _prompt_preview(self, text: str) -> str:
+        # a short stable signature to include in cache-impact parameters
+        return "gemini_mt_prompt_v1"
+
+    def _extract_text(self, response) -> str:
+        # vertexai.preview.generative_models.GenerateContentResponse has .text
+        try:
+            output = (response.text or "").strip()
+            return remove_control_characters(output)
+        except Exception:
+            # Fallback: stitch parts if .text is missing or fails
+            try:
+                parts = []
+                # Access parts through the first candidate
+                for c in getattr(response, "candidates", []) or []:
+                    for part in getattr(c, "content", {}).get("parts", []) or []:
+                        if "text" in part:
+                            parts.append(part["text"])
+                return remove_control_characters(("".join(parts)).strip()) if parts else ""
+            except Exception as e:
+                logger.exception("GeminiTranslator: failed to extract text from response")
+                return ""
+
+    def _update_token_count(self, response):
+        try:
+            # Vertex AI SDK provides usage metadata directly on the response
+            # These attributes align with what was previously on response.usage_metadata
+            if hasattr(response, "total_tokens"):
+                self.token_count.inc(response.total_tokens)
+            # Note: Vertex AI response might not expose prompt_token_count and candidates_token_count directly
+            # at the top level like google.generativeai did, but rather within usage_metadata
+            # or through count_tokens calls.
+            # If these are crucial for your logging, you might need to make a separate count_tokens call.
+            # For now, we'll try to get them if they exist directly on the response or a sub-attribute
+            if hasattr(response, "prompt_token_count") and response.prompt_token_count is not None:
+                self.prompt_token_count.inc(response.prompt_token_count)
+            if hasattr(response, "candidates_token_count") and response.candidates_token_count is not None:
+                self.completion_token_count.inc(response.candidates_token_count)
+            elif hasattr(response, "usage_metadata") and response.usage_metadata is not None:
+                meta = response.usage_metadata
+                if hasattr(meta, "prompt_token_count") and meta.prompt_token_count is not None:
+                    self.prompt_token_count.inc(meta.prompt_token_count)
+                if hasattr(meta, "candidates_token_count") and meta.candidates_token_count is not None:
+                    self.completion_token_count.inc(meta.candidates_token_count)
+
+        except Exception:
+            logger.exception("GeminiTranslator: error updating token counters from Vertex AI response")
+
+    # Keep placeholders consistent with OpenAITranslator for downstream processors
+    def get_formular_placeholder(self, placeholder_id: int):
+        return "{v" + str(placeholder_id) + "}", f"{{\\s*v\\s*{placeholder_id}\\s*}}"
 
     def get_rich_text_left_placeholder(self, placeholder_id: int):
         return (

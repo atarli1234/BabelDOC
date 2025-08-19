@@ -25,6 +25,7 @@ dependencies = [
     "onnx>=1.18.0",
     "onnxruntime>=1.16.1",
     "openai>=1.59.3",
+    "vertexai>=1.71.1",
     "orjson>=3.10.14",
     "charset-normalizer >= 2.0.0",
     "cryptography >= 36.0.0",
